@@ -1,0 +1,77 @@
+Q7 - POST /api/payments
+Provider-independent pseudocode and data model outline
+
+Assumptions
+- The caller is authenticated and authorized to pay the order.
+- Amount/currency come from the server-owned order, not an arbitrary client amount.
+- One payment intent per merchant/order. Refunds and new attempts after a final
+  decline are separate business workflows.
+- The provider supports an idempotency key and payment lookup by that key.
+
+Data model
+Payments: Id, MerchantId, OrderId, IdempotencyKey, RequestHash, AmountMinor,
+          Currency, State, ProviderReference, Version, CreatedAt, UpdatedAt.
+  UNIQUE(MerchantId, IdempotencyKey); UNIQUE(MerchantId, OrderId).
+  UNIQUE(ProviderReference) for this single-provider design.
+Outbox: PaymentId (unique), AvailableAt, LeaseToken, LeaseUntil, Attempts, CompletedAt.
+WebhookInbox: Provider, EventId, PaymentId, ReceivedAt; UNIQUE(Provider, EventId).
+Amounts use integer minor units. Store immutable order amount/currency per intent.
+
+Endpoint
+1. Require Idempotency-Key: 1..128 printable ASCII characters, no spaces/control
+   characters. Validate input and authorize the order.
+2. Hash canonical, versioned merchant/order/amount/currency fields.
+3. BEGIN a short transaction and lock the order row FOR UPDATE.
+   - Existing merchant/key with a different hash: rollback, return 409.
+   - Existing merchant/key with the same hash: return that payment's current state.
+   - Existing merchant/order with another key: return 409 and its authorized location.
+   - For a NEW intent, verify the order is still payable.
+   - Insert Pending payment and its outbox entry in the same transaction.
+   COMMIT. If a unique-key race occurs, rollback and re-read in a fresh transaction.
+4. Return 202 with Location: /api/payments/{id} and Retry-After.
+   A replay after payment success must still work even if the order is now paid.
+   If commit outcome is uncertain, the client retries the SAME key and payload.
+
+Worker and retries
+1. Claim a due outbox item in a short transaction using FOR UPDATE SKIP LOCKED.
+   Set a lease token/expiry and mark Pending as Processing. Commit before HTTP I/O.
+2. Call the provider with a stable key derived from Payment.Id. On retry/Unknown,
+   first look up that same key. Never generate a new provider key for a retry.
+3. Definitive success -> Succeeded; definitive decline -> Declined.
+   Timeout, connection reset or ambiguous 5xx -> Unknown, not Declined.
+4. Retry transient errors with bounded exponential backoff and jitter, honoring
+   Retry-After. Use worker cancellation/deadlines, not an already-disconnected
+   original HTTP request's cancellation token after the intent is committed.
+5. In a new short transaction, lock outbox then payment in a consistent order.
+   Save results only if the lease token still matches. Do not overwrite a terminal
+   state already applied by a webhook. Complete or reschedule the outbox item.
+6. A crash after a provider charge but before DB update is repaired by lookup or
+   replay of the same provider key. After provider deduplication retention expires,
+   unresolved cases need reconciliation/manual review, not blind payment creation.
+
+Webhook
+1. Cap body size and verify the provider signature over exact raw bytes, timestamp
+   tolerance and constant-time MAC comparison. Support secret rotation.
+2. Check merchant, payment reference, amount and currency against the stored intent.
+   Confirm with the provider API if necessary; do not trust unverified body fields.
+3. BEGIN transaction; lock outbox then payment; insert the unique inbox event.
+   Apply an allowed state transition and update outbox together; COMMIT.
+4. Acknowledge 200 only after durable commit. Duplicate committed events also get
+   200. On transient DB failure, rollback and return 503 so delivery is retried.
+5. Never regress Succeeded/Declined to Processing/Unknown. Conflicting terminal
+   evidence and out-of-order events require reconciliation.
+
+States and HTTP responses
+Pending -> Processing -> Succeeded / Declined / Unknown.
+Unknown -> Processing during reconciliation; verified webhooks can finalize any
+nonterminal state. Retain keys and inbox records for the retry/reconciliation window.
+POST replay: 202 while pending/unknown, 200 for success, 422 for final decline.
+GET /api/payments/{id}: 200 with the current state after ownership checks.
+400 invalid input; 401/403 authentication/authorization failure; 404 missing resource;
+409 conflicting key/order; 429 rate limit; 503 temporary infrastructure failure.
+Use ProblemDetails with safe messages and a correlation ID; never return raw secrets.
+
+Distributed locking
+A distributed lock can reduce hot-key contention, but leases can expire and networks
+can partition. Database uniqueness, worker fencing and provider idempotency remain
+necessary. Do not hold database transactions open during provider calls.
